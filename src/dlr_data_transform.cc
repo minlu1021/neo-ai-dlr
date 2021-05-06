@@ -34,7 +34,7 @@ void DataTransform::TransformInput(const nlohmann::json& metadata, const int64_t
         << transformer_type << " is not a valid DataTransform type.";
     const auto transformer = it->second;
 
-    tvm_inputs->at(i) = transformer->InitNDArray(input_json, dtypes[i], ctx);
+    transformer->InitNDArray(input_json, transforms[i], dtypes[i], ctx, tvm_inputs->at(i));
     transformer->MapToNDArray(input_json, transforms[i], tvm_inputs->at(i));
   }
 }
@@ -54,14 +54,19 @@ nlohmann::json DataTransform::GetAsJson(const int64_t* shape, const void* input,
   return input_json;
 }
 
-tvm::runtime::NDArray Transformer::InitNDArray(const nlohmann::json& input_json, DLDataType dtype,
-                                               DLContext ctx) const {
+void Transformer::InitNDArray(const nlohmann::json& input_json, const nlohmann::json& transform,
+                              DLDataType dtype, DLContext ctx,
+                              tvm::runtime::NDArray& input_array) const {
   // Create NDArray for transformed input which will be passed to TVM.
   std::vector<int64_t> arr_shape = {static_cast<int64_t>(input_json.size()),
                                     static_cast<int64_t>(input_json[0].size())};
   CHECK(dtype.code == kDLFloat && dtype.bits == 32 && dtype.lanes == 1)
       << "DataTransform CategoricalString is only supported for float32 inputs.";
-  return tvm::runtime::NDArray::Empty(arr_shape, dtype, ctx);
+  // Only allocate new buffer if not initialized or if shape or dtype has changed. Context will
+  // always match.
+  if (input_array == empty_ || input_array.Shape() != arr_shape) {
+    input_array = tvm::runtime::NDArray::Empty(arr_shape, dtype, ctx);
+  }
 }
 
 void FloatTransformer::MapToNDArray(const nlohmann::json& input_json,
@@ -125,53 +130,65 @@ void CategoricalStringTransformer::MapToNDArray(const nlohmann::json& input_json
   }
 }
 
-tvm::runtime::NDArray DateTimeTransformer::InitNDArray(const nlohmann::json& input_json,
-                                                       DLDataType dtype, DLContext ctx) const {
+void DateTimeTransformer::InitNDArray(const nlohmann::json& input_json,
+                                      const nlohmann::json& transform, DLDataType dtype,
+                                      DLContext ctx, tvm::runtime::NDArray& input_array) const {
   // Create NDArray for transformed input which will be passed to TVM. NUM_COL
   // fixed to 7
+  auto date_col = transform["DateCol"].get<std::vector<int>>();
   std::vector<int64_t> arr_shape = {static_cast<int64_t>(input_json.size()),
-                                    static_cast<int64_t>(kNumDateTimeCols)};
+                                    static_cast<int64_t>(date_col.size() * kNumDateTimeCols)};
   CHECK(dtype.code == kDLFloat && dtype.bits == 32 && dtype.lanes == 1)
       << "DataTransform DateTimeTransformer is only supported for float32 "
          "inputs.";
-  return tvm::runtime::NDArray::Empty(arr_shape, dtype, ctx);
+  if (input_array == empty_ || input_array.Shape() != arr_shape) {
+    input_array = tvm::runtime::NDArray::Empty(arr_shape, dtype, ctx);
+  }
 }
 
-int64_t DateTimeTransformer::GetWeekDay(int64_t year, int64_t month, int64_t day) const {
-  int64_t century = year / 100;
-  int64_t month_ = month == 2 ? 12 : postive_modulo((month - 2), 12);
-  int64_t year_ = month <= 2 ? year % 100 - 1 : year % 100;
-  int64_t weekday = postive_modulo((day + (int64_t)std::floor(2.6 * month_ - 0.2) - 2 * century +
-                                    year_ + year_ / 4 + century / 4),
-                                   7);
-  weekday = weekday == 0 ? 7 : weekday;
-  return weekday;
+bool DateTimeTransformer::isLeap(int64_t year) const {
+  if (year % 4 == 0) {
+    if (year % 100 == 0 && year % 400 != 0)
+      return false;
+    else
+      return true;
+  }
+  return false;
+}
+
+int64_t DateTimeTransformer::GetWeekNumber(std::tm tm) const {
+  // mktime(&tm);
+  int day_of_the_week = (tm.tm_wday + 6) % 7;
+  tm.tm_mday -= day_of_the_week;
+  tm.tm_mday += 3;
+  mktime(&tm);
+  return tm.tm_yday / 7 + 1;
 }
 
 void DateTimeTransformer::DigitizeDateTime(std::string& input_string,
                                            std::vector<int64_t>& datetime_digits) const {
-  struct tm tm = {};
+  struct tm tm {};
 
   char* strptime_success;
   for (const auto datetime_template : datetime_templates) {
     strptime_success = strptime(input_string.c_str(), datetime_template.c_str(), &tm);
     if (strptime_success) {
+      if (datetime_template.compare(0, 8, "%H:%M:%S") == 0) {
+        std::time_t t = std::time(0);
+        tm = *std::localtime(&t);
+        strptime_success = strptime(input_string.c_str(), datetime_template.c_str(), &tm);
+      }
       break;
     }
   }
 
-  int64_t week_offset =
-      GetWeekDay(1900 + tm.tm_year, 1, 1) == 0 ? 0 : (7 - GetWeekDay(1900 + tm.tm_year, 1, 1)) + 1;
-  int64_t week_of_year = (tm.tm_yday) / 7;
-  if (week_offset > 0) week_of_year += 1;
-
-  datetime_digits[0] = tm.tm_wday;
+  datetime_digits[0] = tm.tm_wday == 0 ? 7 : tm.tm_wday;
   datetime_digits[1] = 1900 + tm.tm_year;
   datetime_digits[2] = tm.tm_hour;
   datetime_digits[3] = tm.tm_min;
   datetime_digits[4] = tm.tm_sec;
   datetime_digits[5] = 1 + tm.tm_mon;
-  datetime_digits[6] = week_of_year;
+  datetime_digits[6] = GetWeekNumber(tm);
 }
 
 void DateTimeTransformer::MapToNDArray(const nlohmann::json& input_json,
@@ -186,12 +203,14 @@ void DateTimeTransformer::MapToNDArray(const nlohmann::json& input_json,
   for (size_t r = 0; r < input_json.size(); ++r) {
     CHECK(input_json[r].size() > 0)
         << "Input must contains a string of format [Date Month, Year, Time].";
-    auto date_col = transform["DateCol"].get_ref<const nlohmann::json::number_integer_t&>();
-    std::string entry = input_json[r][date_col].get_ref<const std::string&>();
-    DigitizeDateTime(entry, datetime_digits);
-    for (size_t c = 0; c < kNumDateTimeCols; ++c) {
-      const int out_index = r * kNumDateTimeCols + c;
-      data[out_index] = static_cast<float>(datetime_digits[c]);
+    auto date_col = transform["DateCol"].get<std::vector<int>>();
+    for (size_t i = 0; i < date_col.size(); ++i) {
+      std::string entry = input_json[r][date_col[i]].get_ref<const std::string&>();
+      DigitizeDateTime(entry, datetime_digits);
+      for (size_t c = 0; c < kNumDateTimeCols; ++c) {
+        const int out_index = r * date_col.size() * kNumDateTimeCols + i * kNumDateTimeCols + c;
+        data[out_index] = static_cast<float>(datetime_digits[c]);
+      }
     }
   }
 }

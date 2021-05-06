@@ -12,6 +12,3 @@
 	path = 3rdparty/dlfcn-win32
 	url = https://github.com/dlfcn-win32/dlfcn-win32.git
 	branch = master
-[submodule "3rdparty/fmt"]
-	path = 3rdparty/fmt
-	url = https://github.com/fmtlib/fmt.git

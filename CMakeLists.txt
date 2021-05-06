@@ -6,6 +6,8 @@ include(3rdparty/tvm/cmake/utils/FindCUDA.cmake)
 # Option for Android on Arm --- has to come before project() function
 option(ANDROID_BUILD "Build for Android target" OFF)
 option(AAR_BUILD "Build Android Archive (AAR)" OFF)
+option(DLR_BUILD_TESTS "Build DLR tests" ON)
+option(DLR_STATIC_LIBSTDCPP "Use -static-libstdc++" OFF)
 
 if(ANDROID_BUILD)
     set(ANDROID_SYSROOT "${NDK_ROOT}/sysroot")
@@ -15,7 +17,9 @@ if(ANDROID_BUILD)
     endif()
 endif(ANDROID_BUILD)
 
-project(dlr)
+project(dlr VERSION 1.9.0 LANGUAGES C CXX)
+
+message(STATUS "dlr version: ${dlr_VERSION}")
 
 # The following lines should be after project()
 set_default_configuration_release()
@@ -96,13 +100,11 @@ set(LIBNPY_SRC "${PROJECT_SOURCE_DIR}/3rdparty/libnpy")
 set(TREELITE_SRC "${PROJECT_SOURCE_DIR}/3rdparty/treelite")
 set(DMLC_CORE_SRC "${TVM_SRC}/3rdparty/dmlc-core")
 set(DLPACK_SRC "${TVM_SRC}/3rdparty/dlpack")
-set(FMT_SRC "${PROJECT_SOURCE_DIR}/3rdparty/fmt")
 
 include_directories("${TVM_SRC}/include")
 include_directories("${TVM_SRC}/src/runtime")
 include_directories("${DLPACK_SRC}/include")
 include_directories("${DMLC_CORE_SRC}/include")
-include_directories("${FMT_SRC}/include")
 include_directories("${TREELITE_SRC}/include")
 include_directories("${PROJECT_SOURCE_DIR}/include")
 include_directories("${JSON_SRC}")
@@ -255,23 +257,18 @@ add_library(dlr SHARED $<TARGET_OBJECTS:objdlr>)
 set_output_directory(dlr ${CMAKE_BINARY_DIR}/lib)
 set_target_properties(dlr PROPERTIES LINKER_LANGUAGE CXX)
 message(STATUS "DLR_LINKER_LIBS: " ${DLR_LINKER_LIBS})
-if(ANDROID_BUILD)
-  target_link_libraries(dlr treelite_runtime_static tvm_runtime_static ${DLR_LINKER_LIBS})
-else(ANDROID_BUILD)
-  target_link_libraries(dlr treelite_runtime_static tvm_runtime_static ${DLR_LINKER_LIBS} -lpthread)
+target_link_libraries(dlr PRIVATE treelite_runtime_static tvm_runtime_static)
+target_link_libraries(dlr PUBLIC ${DLR_LINKER_LIBS})
+if(DLR_STATIC_LIBSTDCPP)
+  message(STATUS "Using -static-libstdc++")
+  target_link_libraries(dlr PRIVATE -static-libstdc++)
+endif()
+if(NOT(ANDROID_BUILD))
+  target_link_libraries(dlr PUBLIC pthread)
 endif()
 
 add_library(dlr_static STATIC $<TARGET_OBJECTS:objdlr>)
 set_output_directory(dlr_static ${CMAKE_BINARY_DIR}/lib)
-
-set(OPREFIX object_)
-add_custom_target(combined_lib
-	COMMAND mkdir -p ${OPREFIX}tvm_runtime || true && cd ${OPREFIX}tvm_runtime &&  ar -x ${TVM_RUNTIME}
-	COMMAND mkdir -p ${OPREFIX}treelite_runtime || true && cd ${OPREFIX}treelite_runtime &&  ar -x ${TREELITE_RUNTIME}
-	COMMAND g++  ${OPREFIX}*/*.o -shared -o ${CMAKE_CURRENT_SOURCE_DIR}/libcombined.so
-	COMMAND rm -rf ${OPREFIX}*
-	WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        )
 
 # Demos
 set(DEMO_EXECS "")
@@ -294,8 +291,40 @@ foreach(__srcpath ${DEMO_SRCS})
 endforeach()
 add_custom_target(demo DEPENDS ${DEMO_EXECS})
 
+target_include_directories(dlr INTERFACE $<INSTALL_INTERFACE:include>)
+install(TARGETS dlr
+        DESTINATION lib
+        EXPORT dlrTargets)
+install(FILES include/dlr.h DESTINATION include)
+install(EXPORT dlrTargets
+  FILE dlrTargets.cmake
+  DESTINATION lib/cmake/dlr
+)
+
+include(CMakePackageConfigHelpers)
+# generate the config file that is includes the exports
+configure_package_config_file(${CMAKE_CURRENT_SOURCE_DIR}/Config.cmake.in
+  "${CMAKE_CURRENT_BINARY_DIR}/dlrConfig.cmake"
+  INSTALL_DESTINATION "lib/cmake/dlr"
+  NO_SET_AND_CHECK_MACRO
+  NO_CHECK_REQUIRED_COMPONENTS_MACRO
+  )
+# generate the version file for the config file
+write_basic_package_version_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/dlrConfigVersion.cmake"
+  VERSION "${dlr_VERSION}"
+  COMPATIBILITY AnyNewerVersion
+)
+
+# install the configuration file
+install(FILES
+  ${CMAKE_CURRENT_BINARY_DIR}/dlrConfig.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/dlrConfigVersion.cmake
+  DESTINATION lib/cmake/dlr
+)
+
 # Tests
-if(NOT(AAR_BUILD))
+if(DLR_BUILD_TESTS AND NOT(AAR_BUILD))
   include(cmake/googletest.cmake)
   if (WIN32)
     include_directories(${DLFCN_WIN32}/src)
@@ -424,6 +453,22 @@ if(NOT(AAR_BUILD))
     file(REMOVE /tmp/${AUTOML_MODEL})
   endif()
 
+  set(AUTOML_STATIC_MODEL automl_static-ml_m4.tar.gz)
+  set(AUTOML_STATIC_MODEL_DIR ${CMAKE_CURRENT_BINARY_DIR}/automl_static)
+  if(NOT IS_DIRECTORY ${AUTOML_STATIC_MODEL_DIR})
+    file(MAKE_DIRECTORY ${AUTOML_STATIC_MODEL_DIR})
+    download_file(
+      https://neo-ai-dlr-test-artifacts.s3-us-west-2.amazonaws.com/compiled-models/release-1.9.0/${AUTOML_STATIC_MODEL}
+      /tmp/${AUTOML_STATIC_MODEL}
+      SHA1
+      d776a30bcaeceff99844958fc88085972f5aec24
+    )
+    # this is OS-agnostic
+    execute_process(COMMAND ${CMAKE_COMMAND} -E tar -xf /tmp/${AUTOML_STATIC_MODEL}
+                    WORKING_DIRECTORY ${AUTOML_STATIC_MODEL_DIR})
+    file(REMOVE /tmp/${AUTOML_STATIC_MODEL})
+  endif()
+
   set(PIPELINE_MODEL1 ${CMAKE_CURRENT_BINARY_DIR}/pipeline_model1)
   if(NOT IS_DIRECTORY ${PIPELINE_MODEL1})
     file(MAKE_DIRECTORY ${PIPELINE_MODEL1})
@@ -468,6 +513,38 @@ if(NOT(AAR_BUILD))
     execute_process(COMMAND ${CMAKE_COMMAND} -E tar -xf /tmp/${INVERSELABEL_MODEL}
                     WORKING_DIRECTORY ${INVERSELABEL_MODEL_DIR})
     file(REMOVE /tmp/${INVERSELABEL_MODEL})
+  endif()
+
+  set(INPUTORDER_MODEL input_order-ml_m4.tar.gz)
+  set(INPUTORDER_MODEL_DIR ${CMAKE_CURRENT_BINARY_DIR}/input_order)
+  if(NOT IS_DIRECTORY ${INPUTORDER_MODEL_DIR})
+    file(MAKE_DIRECTORY ${INPUTORDER_MODEL_DIR})
+    download_file(
+      https://neo-ai-dlr-test-artifacts.s3-us-west-2.amazonaws.com/compiled-models/release-1.9.0/${INPUTORDER_MODEL}
+      /tmp/${INPUTORDER_MODEL}
+      SHA1
+      e677130d4e47f0a5298f0280aa36a28ae9bb5ef1
+    )
+    # this is OS-agnostic
+    execute_process(COMMAND ${CMAKE_COMMAND} -E tar -xf /tmp/${INPUTORDER_MODEL}
+                    WORKING_DIRECTORY ${INPUTORDER_MODEL_DIR})
+    file(REMOVE /tmp/${INPUTORDER_MODEL})
+  endif()
+
+  set(INVERSELABEL_STATIC_MODEL inverselabel_static-ml_m4.tar.gz)
+  set(INVERSELABEL_STATIC_MODEL_DIR ${CMAKE_CURRENT_BINARY_DIR}/inverselabel_static)
+  if(NOT IS_DIRECTORY ${INVERSELABEL_STATIC_MODEL_DIR})
+    file(MAKE_DIRECTORY ${INVERSELABEL_STATIC_MODEL_DIR})
+    download_file(
+      https://neo-ai-dlr-test-artifacts.s3-us-west-2.amazonaws.com/compiled-models/release-1.9.0/${INVERSELABEL_STATIC_MODEL}
+      /tmp/${INVERSELABEL_STATIC_MODEL}
+      SHA1
+      bc4b0d958a18579362c4255741fdb4b86ab92aad
+    )
+    # this is OS-agnostic
+    execute_process(COMMAND ${CMAKE_COMMAND} -E tar -xf /tmp/${INVERSELABEL_STATIC_MODEL}
+                    WORKING_DIRECTORY ${INVERSELABEL_STATIC_MODEL_DIR})
+    file(REMOVE /tmp/${INVERSELABEL_STATIC_MODEL})
   endif()
 
   if(WITH_HEXAGON)

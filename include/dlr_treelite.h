@@ -23,6 +23,7 @@ struct TreeliteInput {
   size_t num_row;
   size_t num_col;
   DMatrixHandle handle;
+  ~TreeliteInput();
 };
 
 /*! \brief Get the paths of the Treelite model files.
